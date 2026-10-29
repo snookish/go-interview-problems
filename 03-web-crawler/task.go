@@ -1,29 +1,75 @@
 package main
 
+import (
+	"errors"
+	"sync"
+)
+
 type Fetcher interface {
-	// Fetch returns the body of URL and
-	// a slice of URLs found on that page.
 	Fetch(url string) (body string, urls []string, err error)
 }
 
-// Crawl uses fetcher to recursively crawl
-// pages starting with url, to a maximum of depth.
+type crawler struct {
+	fetcher Fetcher
+	mu      sync.Mutex
+	visited map[string]struct{}
+	sem     chan struct{}
+}
+
 func Crawl(url string, depth int, fetcher Fetcher) ([]string, error) {
-	// TODO: Fetch URLs in parallel.
-	// TODO: Don't fetch the same URL twice.
-	// This implementation doesn't do either:
 	if depth <= 0 {
 		return nil, nil
 	}
-	body, urls, err := fetcher.Fetch(url)
+
+	c := &crawler{
+		fetcher: fetcher,
+		visited: make(map[string]struct{}),
+		sem:     make(chan struct{}, 10), // At most 10 concurrent fetches.
+	}
+
+	return c.crawl(url, depth)
+}
+
+func (c *crawler) crawl(url string, depth int) ([]string, error) {
+	if depth <= 0 {
+		return nil, nil
+	}
+
+	c.mu.Lock()
+	if _, exists := c.visited[url]; exists {
+		c.mu.Unlock()
+		return nil, nil
+	}
+	c.visited[url] = struct{}{}
+	c.mu.Unlock()
+
+	c.sem <- struct{}{}
+	body, urls, err := c.fetcher.Fetch(url)
+	<-c.sem
+
 	if err != nil {
-		return nil, err
+		return nil, nil // fmt.Errorf("fetch %q: %w", url, err)
 	}
+
+	errs := make([]error, len(urls))
+	results := make([][]string, len(urls))
+
+	var wg sync.WaitGroup
+	wg.Add(len(urls))
+
+	for i, u := range urls {
+		go func(i int, u string) {
+			defer wg.Done()
+			results[i], errs[i] = c.crawl(u, depth-1)
+		}(i, u)
+	}
+
+	wg.Wait()
+
 	result := []string{body}
-	for _, u := range urls {
-		if res, err := Crawl(u, depth-1, fetcher); err == nil {
-			result = append(result, res...)
-		}
+	for _, childResults := range results {
+		result = append(result, childResults...)
 	}
-	return result, nil
+
+	return result, errors.Join(errs...)
 }
